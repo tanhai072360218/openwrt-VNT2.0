@@ -1,0 +1,135 @@
+name: Build VNT2 IPK for OpenWrt (aarch64)
+
+on:
+  workflow_dispatch:  # 手动触发编译
+  push:
+    branches: [ main ]
+    paths:
+      - '.github/workflows/build-vnt2.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare environment
+        run: |
+          sudo apt update
+          sudo apt install -y tar gzip
+
+      - name: Download VNT2 Prebuilt Binary
+        run: |
+          VERSION="2.0.0"
+          ARCH="aarch64"
+          wget https://github.com/vnt-dev/vnt/releases/download/${VERSION}/vnt-${VERSION}-linux-${ARCH}.tar.gz -O vnt.tar.gz
+          tar -zxvf vnt.tar.gz
+          mv vnt-${VERSION}-linux-${ARCH}/vnt-cli ./vnt
+          chmod +x ./vnt
+
+      - name: Create IPK Structure
+        run: |
+          PKG_NAME="vnt2"
+          PKG_VERSION="2.0.0"
+          PKG_RELEASE="1"
+          ARCH="aarch64_cortex-a53"
+          
+          # 创建目录结构
+          mkdir -p ${PKG_NAME}_${PKG_VERSION}-${PKG_RELEASE}_${ARCH}/CONTROL
+          mkdir -p ${PKG_NAME}_${PKG_VERSION}-${PKG_RELEASE}_${ARCH}/usr/bin
+          mkdir -p ${PKG_NAME}_${PKG_VERSION}-${PKG_RELEASE}_${ARCH}/etc/init.d
+          mkdir -p ${PKG_NAME}_${PKG_VERSION}-${PKG_RELEASE}_${ARCH}/etc/config
+
+          # 写入控制文件
+          cat > ${PKG_NAME}_${PKG_VERSION}-${PKG_RELEASE}_${ARCH}/CONTROL/control << EOF
+          Package: vnt2
+          Version: ${PKG_VERSION}-${PKG_RELEASE}
+          Architecture: ${ARCH}
+          Maintainer: GitHub Actions
+          Depends: kmod-tun
+          Section: net
+          Priority: optional
+          Homepage: https://github.com/vnt-dev/vnt
+          Description: VNT 2.0 Virtual Network Tunnel for OpenWrt
+          EOF
+
+          # 写入自启动脚本 (PROCD 标准，适配 OpenWrt 24.10)
+          cat > ${PKG_NAME}_${PKG_VERSION}-${PKG_RELEASE}_${ARCH}/etc/init.d/vnt << 'EOF'
+          #!/bin/sh /etc/rc.common
+          USE_PROCD=1
+          START=99
+
+          start_service() {
+              config_load vnt
+              config_get auth_key main auth_key "123456"
+              config_get port main port "28976"
+              config_get relay main relay "https://relay.rustvnt.com"
+
+              # 生成临时配置到 /tmp，不占用闪存
+              cat > /tmp/vnt.json << EOF_CONFIG
+          {
+            "listen": ":$port",
+            "auth_key": "$auth_key",
+            "relay": ["$relay"]
+          }
+          EOF_CONFIG
+
+              # 使用 procd 管理进程
+              procd_open_instance
+              procd_set_param command /usr/bin/vnt
+              procd_set_param args -c /tmp/vnt.json
+              procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-5}
+              procd_set_param stdout 1
+              procd_set_param stderr 1
+              procd_close_instance
+          }
+
+          stop_service() {
+              procd_kill_instance
+          }
+          EOF
+          chmod +x ${PKG_NAME}_${PKG_VERSION}-${PKG_RELEASE}_${ARCH}/etc/init.d/vnt
+
+          # 写入 UCI 配置文件
+          cat > ${PKG_NAME}_${PKG_VERSION}-${PKG_RELEASE}_${ARCH}/etc/config/vnt << 'EOF'
+          config main
+                  option auth_key '123456'
+                  option port '28976'
+                  option relay 'https://relay.rustvnt.com'
+          EOF
+
+          # 复制二进制文件
+          cp ./vnt ${PKG_NAME}_${PKG_VERSION}-${PKG_RELEASE}_${ARCH}/usr/bin/
+
+          # 打包 IPK (使用 tar 模拟 opkg 打包，修复权限)
+          cd ${PKG_NAME}_${PKG_VERSION}-${PKG_RELEASE}_${ARCH}
+          tar -zcvf ../${PKG_NAME}_${PKG_VERSION}-${PKG_RELEASE}_${ARCH}.ipk \
+              --numeric-owner --owner=0 --group=0 \
+              *
+          cd ..
+
+          # 输出文件信息
+          ls -lh *.ipk
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vnt2-ipk
+          path: ./*.ipk
+          retention-days: 30
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: v2.0.0-openwrt
+          release_name: VNT2 2.0.0 for OpenWrt (aarch64)
+          files: ./*.ipk
+          overwrite: true
+          draft: false
+          prerelease: false
